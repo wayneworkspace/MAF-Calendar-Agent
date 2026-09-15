@@ -1,0 +1,13 @@
+services:
+  calendar-bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    env_file: .env
+    volumes:
+      - ./data:/app/data      # credentials.json + token.json (bot refreshes token in place)
+      - ./logs:/app/logs
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }

@@ -1,0 +1,7 @@
+agent-framework-anthropic>=1.0.0b260827
+discord.py>=2.4.0
+google-api-python-client>=2.150.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+python-dotenv>=1.0.0
+python-dateutil>=2.9.0
