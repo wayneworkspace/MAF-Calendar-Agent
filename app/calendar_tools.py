@@ -1,9 +1,7 @@
-"""
-Google Calendar tools for the agent — mirrors the 5 nodes in the n8n workflow:
-get_events, create_event, update_event, delete_event, check_availability.
+"""Google Calendar integration tools for Calendar Agent.
 
-Each function is a plain Python function with type hints + docstring.
-Agent Framework turns them into LLM-callable tools automatically.
+Provides 5 calendar tools + 1 current datetime helper tool wrapped for
+Microsoft Agent Framework / LLM function calling.
 """
 from __future__ import annotations
 
@@ -12,35 +10,33 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any, Callable
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as dtparser
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
+from googleapiclient.discovery import Resource, build
 from pydantic import Field
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
-
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 TZ_NAME = os.getenv("TIMEZONE", "Asia/Ho_Chi_Minh")
 TZ = ZoneInfo(TZ_NAME)
 
-_service = None
+_service: Resource | None = None
 log = logging.getLogger("calendar-tools")
 
 
-def _tool(fn):
-    """Log any exception with the real cause and return it to the model as a readable error."""
-
+def _tool(fn: Callable[..., str]) -> Callable[..., str]:
+    """Decorator to catch exceptions in tools, log them, and return a JSON error string to the agent."""
     @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: Any, **kwargs: Any) -> str:
         try:
             return fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
-            log.exception("tool %s failed", fn.__name__)
+            log.exception("Tool %s failed: %s", fn.__name__, exc)
             return json.dumps({"error": f"{type(exc).__name__}: {exc}"[:800]})
 
     return wrapper
@@ -49,14 +45,14 @@ def _tool(fn):
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _get_service():
-    """Lazily build an authenticated Calendar API client, refreshing the token if needed."""
+def get_calendar_service() -> Resource:
+    """Lazily build an authenticated Google Calendar API client, refreshing token if expired."""
     global _service
     if _service is not None:
         return _service
 
     if not os.path.exists(TOKEN_FILE):
-        raise RuntimeError("token.json not found. Run `python auth.py` first.")
+        raise RuntimeError(f"Token file '{TOKEN_FILE}' not found. Run `python auth.py` first.")
 
     creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     if creds.expired and creds.refresh_token:
@@ -68,15 +64,22 @@ def _get_service():
     return _service
 
 
+def reset_calendar_service() -> None:
+    """Reset cached service instance (useful for testing or re-authentication)."""
+    global _service
+    _service = None
+
+
 def _to_rfc3339(value: str) -> str:
-    """Parse a natural/ISO datetime string and return RFC3339 in the configured timezone."""
+    """Parse a natural/ISO datetime string and return an RFC3339 formatted string with timezone."""
     dt = dtparser.parse(value)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
     return dt.isoformat()
 
 
-def _fmt_event(ev: dict) -> dict:
+def _fmt_event(ev: dict[str, Any]) -> dict[str, Any]:
+    """Format raw Google Calendar API event dictionary into a simplified clean payload."""
     start = ev.get("start", {})
     end = ev.get("end", {})
     return {
@@ -86,12 +89,13 @@ def _fmt_event(ev: dict) -> dict:
         "end": end.get("dateTime") or end.get("date"),
         "location": ev.get("location"),
         "description": ev.get("description"),
-        "attendees": [a.get("email") for a in ev.get("attendees", [])],
+        "attendees": [a.get("email") for a in ev.get("attendees", []) if isinstance(a, dict)],
         "link": ev.get("htmlLink"),
     }
 
 
 def now_local() -> datetime:
+    """Return the current datetime in the configured local timezone."""
     return datetime.now(TZ)
 
 
@@ -99,8 +103,7 @@ def now_local() -> datetime:
 # Tools
 # --------------------------------------------------------------------------- #
 def get_current_datetime() -> str:
-    """Get the current date, time, weekday and timezone. Call this before resolving
-    relative dates like 'tomorrow', 'next Friday', 'this afternoon'."""
+    """Get the current date, time, weekday, and timezone. Call before resolving relative dates."""
     n = now_local()
     return json.dumps({
         "now": n.isoformat(),
@@ -110,12 +113,12 @@ def get_current_datetime() -> str:
 
 
 def get_events(
-    start: Annotated[str, Field(description="Range start, ISO 8601 e.g. 2026-09-06T00:00:00")],
-    end: Annotated[str, Field(description="Range end, ISO 8601 e.g. 2026-09-06T23:59:59")],
-    max_results: Annotated[int, Field(description="Max events to return", ge=1, le=50)] = 20,
+    start: Annotated[str, Field(description="Range start, ISO 8601 string e.g. 2026-09-06T00:00:00")],
+    end: Annotated[str, Field(description="Range end, ISO 8601 string e.g. 2026-09-06T23:59:59")],
+    max_results: Annotated[int, Field(description="Maximum number of events to return", ge=1, le=50)] = 20,
 ) -> str:
-    """List calendar events between start and end. Returns id, title, start, end, location."""
-    svc = _get_service()
+    """List calendar events between start and end date/times."""
+    svc = get_calendar_service()
     resp = (
         svc.events()
         .list(
@@ -133,11 +136,11 @@ def get_events(
 
 
 def check_availability(
-    start: Annotated[str, Field(description="Window start, ISO 8601")],
-    end: Annotated[str, Field(description="Window end, ISO 8601")],
+    start: Annotated[str, Field(description="Window start, ISO 8601 string")],
+    end: Annotated[str, Field(description="Window end, ISO 8601 string")],
 ) -> str:
-    """Check whether a time window is free. Returns 'free' or the list of conflicting events."""
-    svc = _get_service()
+    """Check whether a time window is free. Returns 'free' or lists conflicting events."""
+    svc = get_calendar_service()
     resp = (
         svc.freebusy()
         .query(
@@ -150,25 +153,24 @@ def check_availability(
         )
         .execute()
     )
-    busy = resp["calendars"][CALENDAR_ID].get("busy", [])
+    busy = resp.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
     if not busy:
         return json.dumps({"status": "free", "conflicts": []})
 
-    # Fetch the conflicting events for nicer output
-    conflicts = json.loads(get_events(start, end))["events"]
+    conflicts = json.loads(get_events(start, end)).get("events", [])
     return json.dumps({"status": "busy", "conflicts": conflicts}, ensure_ascii=False)
 
 
 def create_event(
     title: Annotated[str, Field(description="Event title")],
-    start: Annotated[str, Field(description="Start, ISO 8601 e.g. 2026-09-06T14:00:00")],
-    end: Annotated[str | None, Field(description="End, ISO 8601. Defaults to start + 1 hour")] = None,
-    description: Annotated[str | None, Field(description="Optional notes")] = None,
-    location: Annotated[str | None, Field(description="Optional location")] = None,
-    attendees: Annotated[list[str] | None, Field(description="Optional attendee emails")] = None,
+    start: Annotated[str, Field(description="Start time in ISO 8601 format e.g. 2026-09-06T14:00:00")],
+    end: Annotated[str | None, Field(description="End time in ISO 8601 format. Defaults to start + 1 hour")] = None,
+    description: Annotated[str | None, Field(description="Optional event description or notes")] = None,
+    location: Annotated[str | None, Field(description="Optional event location")] = None,
+    attendees: Annotated[list[str] | None, Field(description="Optional attendee email addresses")] = None,
 ) -> str:
-    """Create a new calendar event. ONLY call after the user has explicitly confirmed the details."""
-    svc = _get_service()
+    """Create a new calendar event. ONLY call after user explicitly confirms details."""
+    svc = get_calendar_service()
     start_dt = dtparser.parse(start)
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=TZ)
@@ -176,7 +178,7 @@ def create_event(
     if end_dt.tzinfo is None:
         end_dt = end_dt.replace(tzinfo=TZ)
 
-    body: dict = {
+    body: dict[str, Any] = {
         "summary": title,
         "start": {"dateTime": start_dt.isoformat(), "timeZone": TZ_NAME},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": TZ_NAME},
@@ -193,15 +195,15 @@ def create_event(
 
 
 def update_event(
-    event_id: Annotated[str, Field(description="ID of the event to update (from get_events)")],
+    event_id: Annotated[str, Field(description="ID of event to update (obtained from get_events)")],
     title: Annotated[str | None, Field(description="New title")] = None,
-    start: Annotated[str | None, Field(description="New start, ISO 8601")] = None,
-    end: Annotated[str | None, Field(description="New end, ISO 8601")] = None,
-    description: Annotated[str | None, Field(description="New notes")] = None,
+    start: Annotated[str | None, Field(description="New start time in ISO 8601 format")] = None,
+    end: Annotated[str | None, Field(description="New end time in ISO 8601 format")] = None,
+    description: Annotated[str | None, Field(description="New event description")] = None,
     location: Annotated[str | None, Field(description="New location")] = None,
 ) -> str:
-    """Update fields of an existing event. ONLY call after the user has explicitly confirmed."""
-    svc = _get_service()
+    """Update fields of an existing event. ONLY call after user explicitly confirms details."""
+    svc = get_calendar_service()
     ev = svc.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
 
     if title:
@@ -215,12 +217,13 @@ def update_event(
     if end:
         ev["end"] = {"dateTime": _to_rfc3339(end), "timeZone": TZ_NAME}
     elif start:
-        # keep original duration if only start moved
-        old_start = dtparser.parse(ev["start"]["dateTime"]) if "dateTime" in ev["start"] else None
-        old_end = dtparser.parse(ev["end"]["dateTime"]) if "dateTime" in ev["end"] else None
-        if old_start and old_end:
+        old_start_str = ev.get("start", {}).get("dateTime")
+        old_end_str = ev.get("end", {}).get("dateTime")
+        if old_start_str and old_end_str:
+            old_start = dtparser.parse(old_start_str)
+            old_end = dtparser.parse(old_end_str)
             duration = old_end - old_start
-            new_start = dtparser.parse(ev["start"]["dateTime"])
+            new_start = dtparser.parse(_to_rfc3339(start))
             ev["end"] = {"dateTime": (new_start + duration).isoformat(), "timeZone": TZ_NAME}
 
     updated = svc.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=ev).execute()
@@ -228,10 +231,10 @@ def update_event(
 
 
 def delete_event(
-    event_id: Annotated[str, Field(description="ID of the event to delete (from get_events)")],
+    event_id: Annotated[str, Field(description="ID of event to delete (obtained from get_events)")],
 ) -> str:
-    """Delete an event permanently. ONLY call after the user has explicitly confirmed."""
-    svc = _get_service()
+    """Delete an event permanently. ONLY call after user explicitly confirms."""
+    svc = get_calendar_service()
     svc.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
     return json.dumps({"status": "deleted", "event_id": event_id})
 

@@ -1,18 +1,17 @@
-"""
-Calendar AI Agent built with Microsoft Agent Framework.
+"""Calendar AI Agent module built with Microsoft Agent Framework.
 
-Model  : Anthropic Claude via agent-framework-anthropic (AnthropicClient)
-Memory : in-RAM sliding window per Discord chat (like n8n's Window Buffer Memory)
-Tools  : calendar_tools.ALL_TOOLS
+Provides model client configuration, system instruction definitions,
+and per-chat in-memory session management.
 """
 from __future__ import annotations
 
 import os
+from typing import Dict
 
 from agent_framework import Agent, AgentSession, SlidingWindowStrategy
 from agent_framework.anthropic import AnthropicClient
 
-from calendar_tools import ALL_TOOLS, TZ_NAME
+from app.calendar_tools import ALL_TOOLS, TZ_NAME
 
 INSTRUCTIONS = f"""
 You are a personal Calendar Assistant connected to the user's Google Calendar.
@@ -21,13 +20,13 @@ Always reply in English, concise and friendly, formatted for a Discord chat
 
 Timezone: {TZ_NAME}. All times you show or send to tools are in this timezone.
 
-RULES
+RULES:
 1. Every user message starts with "[Now: <date time weekday timezone>]". Use it to resolve
    relative dates ("tomorrow", "next Friday", "this afternoon"). Do NOT call get_current_datetime
    unless that prefix is missing. Never guess today's date.
 2. Reading is free: for questions like "what's on my calendar", "am I free at 3pm",
    call get_events / check_availability immediately and answer.
-3. Writing needs confirmation: before create_event, update_event or delete_event you MUST
+3. Writing needs confirmation: before create_event, update_event, or delete_event you MUST
    first summarise exactly what you are about to do (title, date, start–end, location)
    and ask "Confirm? (yes/no)". Only call the tool after the user clearly says yes.
    If they change something, re-summarise and ask again.
@@ -42,6 +41,7 @@ RULES
 
 
 def build_agent() -> Agent:
+    """Instantiate and configure the Calendar AI Agent."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set (see .env.example)")
@@ -56,22 +56,27 @@ def build_agent() -> Agent:
         name="CalendarAgent",
         instructions=INSTRUCTIONS,
         tools=ALL_TOOLS,
-        # Keep only the last N user/assistant groups → bounded memory, like Window Buffer Memory
         compaction_strategy=SlidingWindowStrategy(keep_last_groups=window),
     )
 
 
 class SessionStore:
-    """One in-memory AgentSession per Discord chat id. Lost on restart (by design)."""
+    """In-memory store for AgentSession instances keyed by Discord chat/channel ID."""
 
     def __init__(self, agent: Agent) -> None:
         self._agent = agent
-        self._sessions: dict[int, AgentSession] = {}
+        self._sessions: Dict[int, AgentSession] = {}
 
     def get(self, chat_id: int) -> AgentSession:
+        """Get existing session or create a new one for the given chat ID."""
         if chat_id not in self._sessions:
             self._sessions[chat_id] = self._agent.create_session(session_id=str(chat_id))
         return self._sessions[chat_id]
 
     def reset(self, chat_id: int) -> None:
+        """Clear conversation memory for a given chat ID."""
         self._sessions.pop(chat_id, None)
+
+    def clear_all(self) -> None:
+        """Clear all stored sessions."""
+        self._sessions.clear()
